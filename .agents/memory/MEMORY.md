@@ -1,0 +1,2 @@
+- [Scribe mobile editor constraints](scribe-editor-constraints.md) — controlled TextInput must stay; uncontrolled approach caused IME/duplication bugs on real Android.
+- [Scribe editor bug fixes](scribe-editor-bugfixes.md) — three fixes applied: paste startTransition, smart-enter/skip-over snapScrollToCursor anti-jump.
