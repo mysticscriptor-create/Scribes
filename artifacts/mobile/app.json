@@ -20,7 +20,7 @@
       "package": "com.primaloptima.scribe",
       "versionCode": 2,
       "jsEngine": "hermes",
-      "softwareKeyboardLayoutMode": "pan",
+      "softwareKeyboardLayoutMode": "resize",
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/icon.png",
         "backgroundColor": "#f5efe4"

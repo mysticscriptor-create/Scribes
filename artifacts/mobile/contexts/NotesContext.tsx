@@ -208,6 +208,15 @@ export function NotesProvider({ children }: { children: React.ReactNode }) {
   const folders = isExternal ? externalFolders : vaultFolders;
 
   const writeTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  // In-memory content cache: keeps the latest typed content without calling
+  // setVaultNotes on every 120ms autosave tick, which would re-render every
+  // NotesContext subscriber on every keystroke and was the primary cause of
+  // typing lag on documents longer than ~3k words.
+  const contentCacheRef = useRef<Record<string, string>>({});
+  // Stable mirror of vaultNotes for use inside async timer callbacks that
+  // cannot safely close over the React state value.
+  const vaultNotesRef = useRef<NoteFile[]>([]);
+  const contentWriteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Hydrate from AsyncStorage
   useEffect(() => {
@@ -262,20 +271,64 @@ export function NotesProvider({ children }: { children: React.ReactNode }) {
   // synchronous so the UI/word count never feels stale) and force an
   // immediate flush when the app backgrounds so nothing is lost.
   const vaultWriteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Keep vaultNotesRef in sync so timer callbacks always see the latest
+  // structural state without closing over a stale array.
+  useEffect(() => {
+    vaultNotesRef.current = vaultNotes;
+  }, [vaultNotes]);
+
+  // Persist content cache to AsyncStorage without touching React state.
+  // Called from updateNoteContent on every autosave tick; because it never
+  // calls setVaultNotes, NotesContext subscribers never re-render mid-typing.
+  const scheduleContentWrite = useCallback(() => {
+    if (contentWriteTimerRef.current) clearTimeout(contentWriteTimerRef.current);
+    contentWriteTimerRef.current = setTimeout(() => {
+      contentWriteTimerRef.current = null;
+      const snapshot = vaultNotesRef.current.map((n) => {
+        const cached = contentCacheRef.current[n.id];
+        return cached !== undefined
+          ? { ...n, content: cached, updatedAt: Date.now() }
+          : n;
+      });
+      AsyncStorage.setItem(NOTES_KEY, JSON.stringify(snapshot)).catch(() => {});
+    }, 600);
+  }, []);
+
   const flushVaultNotes = useCallback(() => {
     if (vaultWriteTimerRef.current) {
       clearTimeout(vaultWriteTimerRef.current);
       vaultWriteTimerRef.current = null;
     }
-    AsyncStorage.setItem(NOTES_KEY, JSON.stringify(vaultNotes)).catch(() => {});
-  }, [vaultNotes]);
+    if (contentWriteTimerRef.current) {
+      clearTimeout(contentWriteTimerRef.current);
+      contentWriteTimerRef.current = null;
+    }
+    // Merge cached content so the background flush always includes the
+    // latest typed text, even if the user hasn't switched notes since typing.
+    const snapshot = vaultNotesRef.current.map((n) => {
+      const cached = contentCacheRef.current[n.id];
+      return cached !== undefined
+        ? { ...n, content: cached, updatedAt: Date.now() }
+        : n;
+    });
+    AsyncStorage.setItem(NOTES_KEY, JSON.stringify(snapshot)).catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (!hydrated) return;
     if (vaultWriteTimerRef.current) clearTimeout(vaultWriteTimerRef.current);
     vaultWriteTimerRef.current = setTimeout(() => {
       vaultWriteTimerRef.current = null;
-      AsyncStorage.setItem(NOTES_KEY, JSON.stringify(vaultNotes)).catch(() => {});
+      // Merge the content cache so structural saves (rename, create, delete)
+      // don't overwrite content that was updated since the last note switch.
+      const snapshot = vaultNotes.map((n) => {
+        const cached = contentCacheRef.current[n.id];
+        return cached !== undefined
+          ? { ...n, content: cached, updatedAt: Date.now() }
+          : n;
+      });
+      AsyncStorage.setItem(NOTES_KEY, JSON.stringify(snapshot)).catch(() => {});
     }, 600);
     return () => {
       if (vaultWriteTimerRef.current) clearTimeout(vaultWriteTimerRef.current);
@@ -570,14 +623,15 @@ export function NotesProvider({ children }: { children: React.ReactNode }) {
           }, 600);
         }
       } else {
-        setVaultNotes((prev) =>
-          prev.map((n) =>
-            n.id === id ? { ...n, content, updatedAt: Date.now() } : n,
-          ),
-        );
+        // Write to in-memory cache only — no setState, no context re-render.
+        // Subscribers (sidebar, title bar, etc.) don't update on every
+        // keystroke; content is flushed to AsyncStorage by scheduleContentWrite
+        // and merged into vaultNotes state during structural operations.
+        contentCacheRef.current[id] = content;
+        scheduleContentWrite();
       }
     },
-    [isExternal, externalNotes],
+    [isExternal, externalNotes, scheduleContentWrite],
   );
 
   const renameNote = useCallback(
@@ -709,13 +763,16 @@ export function NotesProvider({ children }: { children: React.ReactNode }) {
     [notes],
   );
 
-  const activeNote = useMemo(
-    () =>
-      activeNoteId
-        ? (notes.find((n) => n.id === activeNoteId) ?? null)
-        : null,
-    [activeNoteId, notes],
-  );
+  const activeNote = useMemo(() => {
+    if (!activeNoteId) return null;
+    const note = notes.find((n) => n.id === activeNoteId) ?? null;
+    if (!note) return null;
+    // Content cache is always fresher than vaultNotes state. We only read
+    // this at note-switch time (activeNoteId change) so the Editor can
+    // initialize with the latest content; while typing, the Editor owns it.
+    const cached = contentCacheRef.current[note.id];
+    return cached !== undefined ? { ...note, content: cached } : note;
+  }, [activeNoteId, notes]);
 
   const computedVaultName = isExternal && externalRoot ? externalRoot.name : vaultName;
 

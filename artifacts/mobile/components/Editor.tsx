@@ -20,6 +20,15 @@ import {
   type NativeSyntheticEvent,
 } from "react-native";
 import { KeyboardAwareScrollView } from "react-native-keyboard-controller";
+import {
+  cancelAnimation,
+  runOnJS,
+  scrollTo,
+  useAnimatedReaction,
+  useAnimatedRef,
+  useSharedValue,
+  withSpring,
+} from "react-native-reanimated";
 
 import { FONT_FAMILY_MAP } from "@/constants/defaultThemes";
 import { useNotes } from "@/contexts/NotesContext";
@@ -205,12 +214,16 @@ export function Editor({
   const c = activeTheme.colors;
 
   const [content, setContent] = useState(initialContent);
+  // Stable ref to latest content — lets heavy callbacks (handleChangeText,
+  // applyShortcut, undo, redo, …) drop `content` from their deps arrays so
+  // they are not recreated on every keystroke, reducing render cascade.
+  const contentRef = useRef(initialContent);
   const [savedTick, setSavedTick] = useState(0);
   const [collapsedCount, setCollapsedCount] = useState(false);
   const [previewMode, setPreviewMode] = useState(false);
   const [findReplaceOpen, setFindReplaceOpen] = useState(false);
   const [recoveryOffer, setRecoveryOffer] = useState<string | null>(null);
-  const scrollRef = useRef<any>(null);
+  const scrollRef = useAnimatedRef<any>();
   const scrollViewHeightRef = useRef(0);
   const lastWordCountRef = useRef(countWords(initialContent));
   const goalCelebratedRef = useRef(false);
@@ -238,7 +251,10 @@ export function Editor({
   // note switch, never on our own autosave round-trip re-render.
   const mountedNoteIdRef = useRef<string | null>(null);
   const lastLineIndexRef = useRef<number>(-1);
-  const scrollYAnim = useRef(new Animated.Value(0)).current;
+  // Shared value drives the typewriter / jumpToLine scroll entirely on the
+  // Reanimated UI thread, so JS-thread pressure during fast typing cannot
+  // cause animation frame drops that leave the cursor out of view.
+  const scrollTargetY = useSharedValue(0);
   const isAutoScrollingRef = useRef(false);
   // Mirror props in refs so callbacks can read current values without
   // needing to be recreated on every prop change (avoids cascading deps).
@@ -266,6 +282,25 @@ export function Editor({
   useEffect(() => {
     effectiveLineHeightRatioRef.current = LINE_SPACING_MAP[lineSpacing];
   }, [lineSpacing]);
+  // Sync contentRef after every render so stable callbacks always see the
+  // latest value without closing over a potentially stale state variable.
+  useEffect(() => {
+    contentRef.current = content;
+  }, [content]);
+  // Bridge: called from the Reanimated UI thread via runOnJS after a spring
+  // animation completes, to reset the JS-side auto-scroll guard.
+  const setNotAutoScrolling = useCallback(() => {
+    isAutoScrollingRef.current = false;
+  }, []);
+  // Drive the scroll view from scrollTargetY on the UI thread. withSpring
+  // sets the target; this reaction fires on every interpolated frame without
+  // touching the JS thread, so fast typing can never stall the animation.
+  useAnimatedReaction(
+    () => scrollTargetY.value,
+    (y) => {
+      scrollTo(scrollRef, 0, y, false);
+    },
+  );
   // Tracks the live soft-keyboard height via real OS show/hide events rather
   // than relying on the container's onLayout height changing. Android is
   // configured with softwareKeyboardLayoutMode="pan" (required for
@@ -314,7 +349,7 @@ export function Editor({
     mountedNoteIdRef.current = noteId;
 
     lastLineIndexRef.current = -1;
-    scrollYAnim.setValue(0);
+    scrollTargetY.value = 0;
     setFindReplaceOpen(false);
     setRecoveryOffer(null);
 
@@ -352,15 +387,16 @@ export function Editor({
       clearTimeout(saveTimerRef.current);
       saveTimerRef.current = null;
     }
-    if (lastSavedRef.current !== content) {
-      lastSavedRef.current = content;
-      updateNoteContent(noteId, content);
-      onChangeContent?.(content);
+    const current = contentRef.current;
+    if (lastSavedRef.current !== current) {
+      lastSavedRef.current = current;
+      updateNoteContent(noteId, current);
+      onChangeContent?.(current);
       setSavedTick((t) => t + 1);
-      applyWordDelta(content);
-      maybeSnapshot(noteId, content).catch(() => {});
+      applyWordDelta(current);
+      maybeSnapshot(noteId, current).catch(() => {});
     }
-  }, [content, noteId, updateNoteContent, onChangeContent, applyWordDelta]);
+  }, [noteId, updateNoteContent, onChangeContent, applyWordDelta]);
 
   // Schedule debounced save on every content change (120ms).
   // The recovery buffer is written in the same timer as the note content so
@@ -455,21 +491,17 @@ export function Editor({
       const targetY = Math.max(0, lineY - visibleHeight / 2 + lineHeightPx / 2);
 
       isAutoScrollingRef.current = true;
-      scrollYAnim.stopAnimation();
-      scrollYAnim.removeAllListeners();
-      scrollYAnim.addListener(({ value }) => {
-        scrollRef.current?.scrollTo({ y: value, animated: false });
-      });
-      Animated.spring(scrollYAnim, {
-        toValue: targetY,
-        speed: 16,
-        bounciness: 0,
-        useNativeDriver: false,
-      }).start(() => {
-        isAutoScrollingRef.current = false;
+      cancelAnimation(scrollTargetY);
+      scrollTargetY.value = withSpring(targetY, {
+        mass: 0.4,
+        damping: 22,
+        stiffness: 200,
+      }, () => {
+        "worklet";
+        runOnJS(setNotAutoScrolling)();
       });
     },
-    [typewriterMode, scrollYAnim],
+    [typewriterMode, setNotAutoScrolling],
   );
 
   const handleSelectionChange = useCallback(
@@ -570,7 +602,7 @@ export function Editor({
 
   const handleChangeText = useCallback(
     (newText: string) => {
-      const oldText = content;
+      const oldText = contentRef.current;
       const lenDiff = newText.length - oldText.length;
 
       // Single-char insertion: smart pair / smart enter / skip-over
@@ -607,6 +639,7 @@ export function Editor({
             setContent(updated);
             correctNative(updated, diffPos + 1);
             runTypewriterScroll(updated, diffPos + 1);
+            snapScrollToCursor(updated, diffPos + 1);
             return;
           }
         }
@@ -641,6 +674,7 @@ export function Editor({
           pushHistory(oldText);
           setContent(paired);
           correctNative(paired, bpDiffPos);
+          snapScrollToCursor(paired, bpDiffPos);
           return;
         }
       }
@@ -681,7 +715,7 @@ export function Editor({
       const estimatedCursor = newText.length - suffix;
       runTypewriterScroll(newText, estimatedCursor);
     },
-    [content, correctNative, pushHistory, runTypewriterScroll, snapScrollToCursor],
+    [correctNative, pushHistory, runTypewriterScroll, snapScrollToCursor],
   );
 
   const focus = useCallback(() => {
@@ -707,11 +741,11 @@ export function Editor({
       ensureFocused();
       const start = cursorRef.current.start;
       const end = cursorRef.current.end;
-      const before = content.slice(0, start);
-      const middle = content.slice(start, end);
-      const after = content.slice(end);
+      const before = contentRef.current.slice(0, start);
+      const middle = contentRef.current.slice(start, end);
+      const after = contentRef.current.slice(end);
 
-      pushHistory(content);
+      pushHistory(contentRef.current);
 
       if (s.kind === "insert") {
         const updated = before + s.payload + after;
@@ -733,7 +767,7 @@ export function Editor({
         }
       }
     },
-    [content, setCursor, pushHistory, ensureFocused],
+    [setCursor, pushHistory, ensureFocused],
   );
 
   const insertText = useCallback(
@@ -741,30 +775,30 @@ export function Editor({
       ensureFocused();
       const start = cursorRef.current.start;
       const end = cursorRef.current.end;
-      pushHistory(content);
-      const updated = content.slice(0, start) + text + content.slice(end);
+      pushHistory(contentRef.current);
+      const updated = contentRef.current.slice(0, start) + text + contentRef.current.slice(end);
       setContent(updated);
       setCursor(start + text.length);
     },
-    [content, setCursor, pushHistory, ensureFocused],
+    [setCursor, pushHistory, ensureFocused],
   );
 
   const undo = useCallback(() => {
     const h = historyRef.current;
     if (h.past.length === 0) return;
     const { text: prev, cursor } = h.past.pop()!;
-    h.future.push({ text: content, cursor: cursorRef.current.start });
+    h.future.push({ text: contentRef.current, cursor: cursorRef.current.start });
     if (h.future.length > HISTORY_LIMIT) h.future.shift();
     setContent(prev);
     setCursor(cursor);
     notifyUndoRedo();
-  }, [content, setCursor, notifyUndoRedo]);
+  }, [setCursor, notifyUndoRedo]);
 
   const redo = useCallback(() => {
     const h = historyRef.current;
     if (h.future.length === 0) return;
     const { text: next, cursor } = h.future.pop()!;
-    h.past.push({ text: content, cursor: cursorRef.current.start });
+    h.past.push({ text: contentRef.current, cursor: cursorRef.current.start });
     if (h.past.length > HISTORY_LIMIT) h.past.shift();
     setContent(next);
     setCursor(cursor);
@@ -781,7 +815,7 @@ export function Editor({
   // since it's an explicit user navigation action.
   const jumpToLine = useCallback(
     (lineIndex: number) => {
-      const lines = content.split("\n");
+      const lines = contentRef.current.split("\n");
       const clamped = Math.max(0, Math.min(lineIndex, lines.length - 1));
       const pos = lines.slice(0, clamped).reduce((n, l) => n + l.length + 1, 0);
       // Set isAutoScrollingRef BEFORE setCursor so the onSelectionChange event
@@ -801,22 +835,17 @@ export function Editor({
         clamped * lineHeightPx + activeThemeRef.current.paddingVertical;
       const targetY = Math.max(0, lineY - 40);
       lastLineIndexRef.current = clamped;
-      isAutoScrollingRef.current = true;
-      scrollYAnim.stopAnimation();
-      scrollYAnim.removeAllListeners();
-      scrollYAnim.addListener(({ value }) => {
-        scrollRef.current?.scrollTo({ y: value, animated: false });
-      });
-      Animated.spring(scrollYAnim, {
-        toValue: targetY,
-        speed: 16,
-        bounciness: 0,
-        useNativeDriver: false,
-      }).start(() => {
-        isAutoScrollingRef.current = false;
+      cancelAnimation(scrollTargetY);
+      scrollTargetY.value = withSpring(targetY, {
+        mass: 0.4,
+        damping: 22,
+        stiffness: 200,
+      }, () => {
+        "worklet";
+        runOnJS(setNotAutoScrolling)();
       });
     },
-    [content, setCursor, focus, scrollYAnim],
+    [setCursor, focus, setNotAutoScrolling],
   );
 
   // Expose handle to parent
@@ -868,26 +897,26 @@ export function Editor({
       if (!query) return 0;
       const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const re = new RegExp(escapeRe(query), "g" + (caseSensitive ? "" : "i"));
-      const matches = content.match(re);
+      const matches = contentRef.current.match(re);
       if (!matches || matches.length === 0) return 0;
-      pushHistory(content);
+      pushHistory(contentRef.current);
       // Escape $ so JS doesn't treat $1,       const updated = content.replace(re, replacement); etc. as regex back-references.
       const escapedReplacement = replacement.replace(/\$/g, "$$");
-      const updated = content.replace(re, escapedReplacement);
+      const updated = contentRef.current.replace(re, escapedReplacement);
       setContent(updated);
       return matches.length;
     },
-    [content, pushHistory],
+    [pushHistory],
   );
 
   const acceptRecovery = useCallback(() => {
     if (recoveryOffer === null) return;
-    pushHistory(content);
+    pushHistory(contentRef.current);
     setContent(recoveryOffer);
     setCursor(recoveryOffer.length);
     setRecoveryOffer(null);
     clearRecoveryBuffer(noteId).catch(() => {});
-  }, [recoveryOffer, content, pushHistory, setCursor, noteId]);
+  }, [recoveryOffer, pushHistory, setCursor, noteId]);
 
   const dismissRecovery = useCallback(() => {
     setRecoveryOffer(null);
