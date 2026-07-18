@@ -44,7 +44,6 @@ export default function HomeScreen() {
   const c = activeTheme.colors;
 
   const editorRef = useRef<EditorHandle | null>(null);
-  const [editorFocused, setEditorFocused] = useState(false);
   const [titleEditing, setTitleEditing] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const [container, setContainer] = useState({ width: 0, height: 0 });
@@ -271,11 +270,9 @@ export default function HomeScreen() {
               noteId={activeNote.id}
               initialContent={activeNote.content}
               bottomOffset={zenMode ? insets.bottom + 16 : shortcutBarHeight + 16}
+              shortcutBarHeight={zenMode ? 0 : shortcutBarHeight}
               registerHandle={(h) => {
                 editorRef.current = h;
-              }}
-              onSelectionChange={() => {
-                if (!editorFocused) setEditorFocused(true);
               }}
               onUndoRedoChange={setUndoState}
             />

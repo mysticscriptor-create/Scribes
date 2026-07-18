@@ -1,6 +1,5 @@
 import { Feather } from "@expo/vector-icons";
 import React, {
-  startTransition,
   useCallback,
   useEffect,
   useMemo,
@@ -15,6 +14,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  type TextInputKeyPressEventData,
   type TextInputSelectionChangeEventData,
   View,
   type NativeSyntheticEvent,
@@ -189,6 +189,10 @@ type EditorProps = {
   // in, rather than us guessing a fixed number that drifts out of sync with
   // the actual layout and produces mis-scrolled/"cursor out of view" jumps.
   bottomOffset?: number;
+  // Height of the shortcut bar so scroll calculations can subtract it from
+  // the visible area. Without this, centering logic thinks the visible area
+  // is larger than it is and places the cursor behind the bar.
+  shortcutBarHeight?: number;
   onChangeContent?: (content: string) => void;
   onSelectionChange?: (sel: Selection) => void;
   onUndoRedoChange?: (state: { canUndo: boolean; canRedo: boolean }) => void;
@@ -200,6 +204,7 @@ export function Editor({
   initialContent,
   autoFocus = false,
   bottomOffset = 120,
+  shortcutBarHeight: shortcutBarHeightProp = 0,
   onChangeContent,
   onSelectionChange,
   onUndoRedoChange,
@@ -213,16 +218,30 @@ export function Editor({
     useWritingStats();
   const c = activeTheme.colors;
 
+  // `content` state is used ONLY for:
+  //   - MarkdownPreview (synced when entering preview mode)
+  //   - FindReplaceBar search (synced when opening find/replace)
+  //   - Programmatic corrections (auto-pair, smart-enter, undo/redo,
+  //     applyShortcut, insertText, find/replace replacements)
+  //
+  // It is NOT updated on every normal keystroke. The TextInput is
+  // uncontrolled (no `value` prop), so the native layer manages its own
+  // display during typing. This eliminates the per-keystroke JS→native
+  // bridge round-trip of the full document string, which was the primary
+  // cause of typing lag on documents longer than ~3 k words.
   const [content, setContent] = useState(initialContent);
-  // Stable ref to latest content — lets heavy callbacks (handleChangeText,
-  // applyShortcut, undo, redo, …) drop `content` from their deps arrays so
-  // they are not recreated on every keystroke, reducing render cascade.
+  // contentRef is the single source of truth during typing — always current,
+  // no bridge round-trip, accessible from any callback without closures.
   const contentRef = useRef(initialContent);
   const [savedTick, setSavedTick] = useState(0);
   const [collapsedCount, setCollapsedCount] = useState(false);
   const [previewMode, setPreviewMode] = useState(false);
   const [findReplaceOpen, setFindReplaceOpen] = useState(false);
   const [recoveryOffer, setRecoveryOffer] = useState<string | null>(null);
+  // debouncedStatsContent drives the word-count / reading-time display.
+  // Updated in scheduleSave (~500 ms after the last keystroke) so heavy
+  // countWords() calls don't run synchronously on every keystroke.
+  const [debouncedStatsContent, setDebouncedStatsContent] = useState(initialContent);
   const scrollRef = useAnimatedRef<any>();
   const scrollViewHeightRef = useRef(0);
   const lastWordCountRef = useRef(countWords(initialContent));
@@ -260,12 +279,24 @@ export function Editor({
   // needing to be recreated on every prop change (avoids cascading deps).
   const typewriterModeRef = useRef(typewriterMode);
   const activeThemeRef = useRef(activeTheme);
+  // Shortcut bar height in a ref so scroll calculations can subtract it from
+  // the visible area without the callbacks needing to be recreated on resize.
+  const shortcutBarHeightRef = useRef(shortcutBarHeightProp);
+  // iOS Enter-key interception flag: set by onKeyPress when the cursor sits
+  // before a close char, cleared by handleChangeText after it reverts the
+  // newline. This allows the correction to be pre-signalled before the
+  // onChangeText event fires, reducing the one-frame cursor flicker on iOS.
+  const pendingEnterSkipRef = useRef(false);
+
   useEffect(() => {
     typewriterModeRef.current = typewriterMode;
   }, [typewriterMode]);
   useEffect(() => {
     activeThemeRef.current = activeTheme;
   }, [activeTheme]);
+  useEffect(() => {
+    shortcutBarHeightRef.current = shortcutBarHeightProp;
+  }, [shortcutBarHeightProp]);
   // Effective font-size and line-height ratio: mirror the panel overrides so
   // all scroll calculations (typewriter centering, snapScrollToCursor,
   // jumpToLine) use the values the TextInput actually renders at, not the
@@ -282,16 +313,13 @@ export function Editor({
   useEffect(() => {
     effectiveLineHeightRatioRef.current = LINE_SPACING_MAP[lineSpacing];
   }, [lineSpacing]);
-  // Sync contentRef after every render so stable callbacks always see the
-  // latest value without closing over a potentially stale state variable.
-  useEffect(() => {
-    contentRef.current = content;
-  }, [content]);
+
   // Bridge: called from the Reanimated UI thread via runOnJS after a spring
   // animation completes, to reset the JS-side auto-scroll guard.
   const setNotAutoScrolling = useCallback(() => {
     isAutoScrollingRef.current = false;
   }, []);
+
   // Drive the scroll view from scrollTargetY on the UI thread. withSpring
   // sets the target; this reaction fires on every interpolated frame without
   // touching the JS thread, so fast typing can never stall the animation.
@@ -301,22 +329,28 @@ export function Editor({
       scrollTo(scrollRef, 0, y, false);
     },
   );
-  // Tracks the live soft-keyboard height via real OS show/hide events rather
-  // than relying on the container's onLayout height changing. Android is
-  // configured with softwareKeyboardLayoutMode="pan" (required for
-  // react-native-keyboard-controller to own keyboard-avoidance without the
-  // OS double-resizing underneath it) — under "pan" the outer window never
-  // resizes, so scrollViewHeightRef stays at the full un-shrunk screen
-  // height even while the keyboard covers the bottom portion of it. Without
-  // subtracting the real keyboard height here, typewriter mode would center
-  // the active line against the *full* screen instead of the visible area
-  // above the keyboard, pushing it down behind the keys.
-  const keyboardHeightRef = useRef(0);
-  const [debouncedStatsContent, setDebouncedStatsContent] = useState(content);
 
-  // Undo / redo history — each entry stores text AND the cursor position
-  // at the time of the change so that undo/redo restores the cursor to
-  // where the edit was made, not always the end of the document.
+  // Tracks the live soft-keyboard height via real OS show/hide events.
+  const keyboardHeightRef = useRef(0);
+
+  useEffect(() => {
+    const showEvt =
+      Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const hideEvt =
+      Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
+    const showSub = Keyboard.addListener(showEvt, (e) => {
+      keyboardHeightRef.current = e.endCoordinates?.height ?? 0;
+    });
+    const hideSub = Keyboard.addListener(hideEvt, () => {
+      keyboardHeightRef.current = 0;
+    });
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, []);
+
+  // Undo / redo history
   const historyRef = useRef<{
     past: { text: string; cursor: number }[];
     future: { text: string; cursor: number }[];
@@ -327,23 +361,27 @@ export function Editor({
     lastChangeAt: 0,
   });
 
+  // Track last-sent undo/redo booleans so we only call onUndoRedoChange when
+  // the values actually change. Without this, pushHistory (called on every
+  // normal keystroke) triggers a HomeScreen re-render on every key press even
+  // when canUndo/canRedo haven't changed — re-rendering the toolbar, shortcut
+  // bar, and all buttons each time.
+  const lastUndoRedoRef = useRef({ canUndo: false, canRedo: false });
+
   const notifyUndoRedo = useCallback(() => {
-    onUndoRedoChange?.({
-      canUndo: historyRef.current.past.length > 0,
-      canRedo: historyRef.current.future.length > 0,
-    });
+    const canUndo = historyRef.current.past.length > 0;
+    const canRedo = historyRef.current.future.length > 0;
+    if (
+      lastUndoRedoRef.current.canUndo === canUndo &&
+      lastUndoRedoRef.current.canRedo === canRedo
+    ) {
+      return;
+    }
+    lastUndoRedoRef.current = { canUndo, canRedo };
+    onUndoRedoChange?.({ canUndo, canRedo });
   }, [onUndoRedoChange]);
 
   // Initialize editor state exactly once per genuine note switch.
-  //
-  // IMPORTANT: the parent mounts <Editor key={activeNote.id} .../>, so a real
-  // note switch already fully remounts this component and re-initializes all
-  // useState/useRef initial values above. This effect's only remaining job is
-  // the one-time recovery-buffer check. It must NOT depend on `initialContent`
-  // (which changes identity after every autosave round-trip as the parent's
-  // `activeNote.content` updates) or it re-fires on every keystroke's save
-  // cycle, which used to reset the cursor to end-of-text, wipe undo history,
-  // and re-trigger the recovery banner while the user was still typing.
   useEffect(() => {
     if (mountedNoteIdRef.current === noteId) return;
     mountedNoteIdRef.current = noteId;
@@ -358,10 +396,6 @@ export function Editor({
         buf &&
         buf.content !== initialContent &&
         buf.content.trim().length > 0 &&
-        // Only offer recovery if it has at least as many characters as the
-        // currently loaded content. Because the recovery buffer is now written
-        // inside the same 120ms autosave debounce, a shorter buffer means the
-        // user genuinely deleted content — not a scenario worth prompting for.
         buf.content.length >= initialContent.length
       ) {
         setRecoveryOffer(buf.content);
@@ -370,7 +404,7 @@ export function Editor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [noteId]);
 
-  // Track net word-count delta against the writing-stats tracker (goal + streak)
+  // Track net word-count delta against the writing-stats tracker.
   const applyWordDelta = useCallback(
     (savedContent: string) => {
       const newCount = countWords(savedContent);
@@ -381,7 +415,31 @@ export function Editor({
     [recordWordDelta],
   );
 
-  // Force-save helper
+  // Debounced save — replaces the old content-state-driven useEffect.
+  // Called from handleChangeText (normal typing) and all programmatic edits
+  // (undo, redo, applyShortcut, insertText, find/replace). Reads from
+  // contentRef.current at fire time so it always saves the latest text even
+  // if rapid edits happened during the debounce window.
+  const scheduleSave = useCallback(() => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      const current = contentRef.current;
+      if (lastSavedRef.current === current) return;
+      lastSavedRef.current = current;
+      updateNoteContent(noteId, current);
+      onChangeContent?.(current);
+      setSavedTick((t) => t + 1);
+      applyWordDelta(current);
+      maybeSnapshot(noteId, current).catch(() => {});
+      saveRecoveryBuffer(noteId, current).catch(() => {});
+      // Update stats display at the same cadence as the save. Previously
+      // driven by a separate useEffect watching content state, which no
+      // longer fires every keystroke with the uncontrolled TextInput.
+      setDebouncedStatsContent(current);
+    }, 500);
+  }, [noteId, updateNoteContent, onChangeContent, applyWordDelta]);
+
+  // Force-save helper exposed via EditorHandle.flush()
   const flushSave = useCallback(() => {
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);
@@ -398,81 +456,27 @@ export function Editor({
     }
   }, [noteId, updateNoteContent, onChangeContent, applyWordDelta]);
 
-  // Schedule debounced save on every content change (120ms).
-  // The recovery buffer is written in the same timer as the note content so
-  // they're always at the same version — a separate 800ms recovery timer
-  // could be older than the autosave on crash, causing the banner to offer
-  // to "restore" to earlier content.
-  useEffect(() => {
-    if (lastSavedRef.current === content) return;
-    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(() => {
-      lastSavedRef.current = content;
-      updateNoteContent(noteId, content);
-      onChangeContent?.(content);
-      setSavedTick((t) => t + 1);
-      applyWordDelta(content);
-      maybeSnapshot(noteId, content).catch(() => {});
-      saveRecoveryBuffer(noteId, content).catch(() => {});
-    }, 120);
-    return () => {
-      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    };
-  }, [content, noteId, updateNoteContent, onChangeContent, applyWordDelta]);
-
-  // Save when component unmounts or note id changes
+  // Save on unmount / note switch (catches unsaved changes when the user
+  // navigates away before the debounce fires).
   useEffect(() => {
     return () => {
-      if (lastSavedRef.current !== content) {
-        updateNoteContent(noteId, content);
+      if (lastSavedRef.current !== contentRef.current) {
+        updateNoteContent(noteId, contentRef.current);
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [noteId]);
 
-  // Clear forced selection after one render cycle
+  // Clear forced selection after one render cycle so it doesn't permanently
+  // override the user's next tap position.
   useEffect(() => {
     if (!forcedSelection) return;
     const t = setTimeout(() => setForcedSelection(undefined), 30);
     return () => clearTimeout(t);
   }, [forcedSelection]);
 
-  // Track real keyboard height for typewriter centering (see
-  // keyboardHeightRef comment above) — these OS events fire regardless of
-  // softwareKeyboardLayoutMode, unlike onLayout.
-  useEffect(() => {
-    const showEvt = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
-    const hideEvt = Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
-    const showSub = Keyboard.addListener(showEvt, (e) => {
-      keyboardHeightRef.current = e.endCoordinates?.height ?? 0;
-    });
-    const hideSub = Keyboard.addListener(hideEvt, () => {
-      keyboardHeightRef.current = 0;
-    });
-    return () => {
-      showSub.remove();
-      hideSub.remove();
-    };
-  }, []);
-
-  // Word count / char count / reading time are only cosmetic and don't need
-  // to recompute on every keystroke -- on long documents, running
-  // countWords/readingTimeMinutes over the *entire* text synchronously in
-  // render on every keystroke was adding measurable input lag. Debounce the
-  // value they read from instead of the calculation itself, so typing stays
-  // on the fast path and the displayed numbers settle a moment after a
-  // pause, same cadence as the other secondary-sync work in this file.
-  useEffect(() => {
-    const t = setTimeout(() => setDebouncedStatsContent(content), 500);
-    return () => clearTimeout(t);
-  }, [content]);
-
-  // Drives a smooth, spring-eased typewriter scroll. Takes the *authoritative*
-  // text and cursor position directly (never reads the `content` state
-  // closure) so it can be called synchronously from handleChangeText with
-  // data that is guaranteed current, instead of waiting for a React render
-  // and a separate onSelectionChange event — that stale-closure race was the
-  // cause of the oscillating/jittery scroll in typewriter mode.
+  // Drives a smooth, spring-eased typewriter scroll that keeps the active
+  // line vertically centred in the visible area above the keyboard.
   const runTypewriterScroll = useCallback(
     (text: string, pos: number) => {
       if (!typewriterMode || !scrollRef.current) return;
@@ -484,62 +488,52 @@ export function Editor({
         effectiveFontSizeRef.current * effectiveLineHeightRatioRef.current;
       const lineY =
         lineIndex * lineHeightPx + activeThemeRef.current.paddingVertical;
+      // Subtract both the keyboard AND the shortcut bar from the available
+      // height. The shortcut bar lives above the keyboard via KeyboardStickyView
+      // but below the scroll view, so without subtracting it the centering
+      // calculation thinks there's more visible room than there actually is,
+      // pushing the active line behind the bar.
       const visibleHeight = Math.max(
         120,
-        scrollViewHeightRef.current - keyboardHeightRef.current,
+        scrollViewHeightRef.current -
+          keyboardHeightRef.current -
+          shortcutBarHeightRef.current,
       );
-      const targetY = Math.max(0, lineY - visibleHeight / 2 + lineHeightPx / 2);
+      const targetY = Math.max(
+        0,
+        lineY - visibleHeight / 2 + lineHeightPx / 2,
+      );
 
       isAutoScrollingRef.current = true;
       cancelAnimation(scrollTargetY);
-      scrollTargetY.value = withSpring(targetY, {
-        mass: 0.4,
-        damping: 22,
-        stiffness: 200,
-      }, () => {
-        "worklet";
-        runOnJS(setNotAutoScrolling)();
-      });
+      scrollTargetY.value = withSpring(
+        targetY,
+        { mass: 0.4, damping: 22, stiffness: 200 },
+        () => {
+          "worklet";
+          runOnJS(setNotAutoScrolling)();
+        },
+      );
     },
     [typewriterMode, setNotAutoScrolling],
   );
 
   const handleSelectionChange = useCallback(
     (e: NativeSyntheticEvent<TextInputSelectionChangeEventData>) => {
-      // Android can fire a final onSelectionChange reporting a
-      // reset/collapsed selection (e.g. 0,0 or end-of-text) as part of
-      // losing focus -- before the corresponding onBlur has flipped
-      // isFocusedRef. Accepting that value into cursorRef would silently
-      // corrupt the "last real cursor position" that shortcut-bar inserts
-      // rely on, surfacing later as "insert landed at the wrong place" even
-      // though the user never touched the shortcut bar while unfocused.
-      // Only trust selection updates while the input genuinely has focus.
       if (!isFocusedRef.current) return;
       cursorRef.current = e.nativeEvent.selection;
       onSelectionChange?.(e.nativeEvent.selection);
-      // Covers cursor moves that aren't text edits (taps, arrow keys) — edits
-      // are handled synchronously inside handleChangeText instead.
-      // Note: we don't guard on isAutoScrollingRef here. runTypewriterScroll
-      // already short-circuits via lastLineIndexRef when the line hasn't
-      // changed, which handles the common case. The old isAutoScrollingRef
-      // guard was preventing tap-to-new-line from re-centering during an
-      // in-flight animation, leaving the view centered on the wrong line.
-      runTypewriterScroll(content, e.nativeEvent.selection.start);
+      // Read from contentRef instead of the `content` state closure so this
+      // callback is not recreated on every keystroke. contentRef is always
+      // current regardless of whether React state has caught up.
+      runTypewriterScroll(contentRef.current, e.nativeEvent.selection.start);
     },
-    [onSelectionChange, content, runTypewriterScroll],
+    [onSelectionChange, runTypewriterScroll],
   );
 
   // Moves the caret both in React state (so re-renders stay consistent) and
-  // imperatively via setNativeProps (so the native EditText snaps to the new
-  // position on this exact frame instead of waiting a render cycle for the
-  // `selection` prop to land). Android paints the raw keystroke immediately;
-  // without the synchronous setNativeProps call, any programmatic correction
-  // (smart-enter, auto-pair, shortcut-bar insert, undo/redo, etc.) was only
-  // visible after React's next render, producing a visible flash/jump. It
-  // also closes the race where `forcedSelection` cleared itself (30ms below)
-  // before native had applied it, which is what let a busy JS thread on long
-  // documents "lose" the correction and leave the OS to default the caret to
-  // the end of the text.
+  // imperatively via setNativeProps (so the native text view snaps to the new
+  // position on this exact frame instead of waiting a render cycle).
   const setCursor = useCallback((position: number) => {
     cursorRef.current = { start: position, end: position };
     setForcedSelection({ start: position, end: position });
@@ -549,9 +543,8 @@ export function Editor({
   }, []);
 
   // Like setCursor, but also imperatively pushes a corrected `text` value to
-  // the native view. Used by the smart-pair/smart-enter/skip-over paths in
-  // handleChangeText, where we're overriding the exact keystroke Android
-  // just rendered a frame ago.
+  // the native view. Used by the smart-pair/smart-enter/skip-over paths and
+  // all programmatic edits (undo, redo, applyShortcut, insertText).
   const correctNative = useCallback((text: string, position: number) => {
     cursorRef.current = { start: position, end: position };
     setForcedSelection({ start: position, end: position });
@@ -563,23 +556,22 @@ export function Editor({
 
   // Snap the scroll view to keep `position` visible immediately after a
   // programmatic text correction (smart-enter, skip-over, auto-pair).
-  // KeyboardAwareScrollView's Reanimated worklet runs on the UI thread and
-  // fires *before* our JS correction lands, so it briefly scrolls to the
-  // wrong line. Calling this right after correctNative counteracts that
-  // pre-correction scroll and returns the viewport to the correct line
-  // in the same JS turn, minimising the visible jump to at most one frame.
   // Skipped in typewriter mode where runTypewriterScroll owns scrolling.
   const snapScrollToCursor = useCallback((text: string, position: number) => {
     if (typewriterModeRef.current || !scrollRef.current) return;
     const lineIndex = text.slice(0, position).split("\n").length - 1;
     const lineHeightPx =
       effectiveFontSizeRef.current * effectiveLineHeightRatioRef.current;
-    const lineY = lineIndex * lineHeightPx + activeThemeRef.current.paddingVertical;
+    const lineY =
+      lineIndex * lineHeightPx + activeThemeRef.current.paddingVertical;
+    // Subtract shortcut bar so the cursor lands in the truly visible area.
     const visibleH = Math.max(
       120,
-      scrollViewHeightRef.current - keyboardHeightRef.current,
+      scrollViewHeightRef.current -
+        keyboardHeightRef.current -
+        shortcutBarHeightRef.current,
     );
-    const targetY = Math.max(0, lineY - visibleH * 0.35);
+    const targetY = Math.max(0, lineY - visibleH * 0.4);
     scrollRef.current.scrollTo({ y: targetY, animated: false });
   }, []);
 
@@ -600,12 +592,38 @@ export function Editor({
     [notifyUndoRedo],
   );
 
+  // iOS Enter-key interception — fires BEFORE onChangeText on iOS soft
+  // keyboards. When the cursor sits before a closing bracket/quote, we
+  // pre-signal the smart-enter correction so handleChangeText can revert the
+  // newline as early as possible in the event pipeline, reducing the
+  // one-frame cursor flicker. On Android the soft keyboard does not fire
+  // onKeyPress reliably for Enter, so we rely on onChangeText there.
+  const handleKeyPress = useCallback(
+    (e: NativeSyntheticEvent<TextInputKeyPressEventData>) => {
+      if (Platform.OS !== "ios") return;
+      if (e.nativeEvent.key !== "Enter") return;
+      const pos = cursorRef.current.start;
+      // Only act on a collapsed cursor — a selection should produce a normal
+      // newline replacing the selected text.
+      if (pos !== cursorRef.current.end) return;
+      const charAfterCursor = contentRef.current[pos] ?? "";
+      if (!CLOSE_CHARS.has(charAfterCursor)) return;
+      // Pre-position the cursor past the close char. The native text view
+      // will still insert the newline (we can't preventDefault in RN), but
+      // handleChangeText reverts it in the same JS turn, minimising the
+      // visible flash.
+      pendingEnterSkipRef.current = true;
+      setCursor(pos + 1);
+    },
+    [setCursor],
+  );
+
   const handleChangeText = useCallback(
     (newText: string) => {
       const oldText = contentRef.current;
       const lenDiff = newText.length - oldText.length;
 
-      // Single-char insertion: smart pair / smart enter / skip-over
+      // ── Single-character insertion ────────────────────────────────────────
       if (lenDiff === 1) {
         const diffPos = commonPrefixLen(
           oldText,
@@ -615,19 +633,19 @@ export function Editor({
         const insertedChar = newText[diffPos] ?? "";
         const charAfterCursor = oldText[diffPos] ?? "";
 
-        // Smart enter: cursor sits just before a closing bracket/quote;
-        // skip past the close char instead of inserting a newline.
-        // snapScrollToCursor fires immediately after the correction to
-        // counteract the KAScrollView pre-correction scroll that already
-        // moved the viewport one line down before our JS handler ran.
+        // Smart enter: cursor sits just before a closing bracket/quote.
+        // pendingEnterSkipRef may already be set by onKeyPress (iOS).
         if (insertedChar === "\n" && CLOSE_CHARS.has(charAfterCursor)) {
-          setContent(oldText);
+          pendingEnterSkipRef.current = false;
+          // contentRef stays unchanged (revert to oldText).
           correctNative(oldText, diffPos + 1);
           runTypewriterScroll(oldText, diffPos + 1);
           snapScrollToCursor(oldText, diffPos + 1);
           return;
         }
-        // Auto-pair
+        pendingEnterSkipRef.current = false;
+
+        // Auto-pair: insert matching close char after the open char.
         if (PAIR_OPEN_TO_CLOSE[insertedChar]) {
           const closeChar = PAIR_OPEN_TO_CLOSE[insertedChar];
           if (charAfterCursor !== closeChar) {
@@ -636,27 +654,37 @@ export function Editor({
               newText.slice(0, diffPos + 1) +
               closeChar +
               newText.slice(diffPos + 1);
-            setContent(updated);
+            contentRef.current = updated;
+            // Reset lastLineIndexRef so runTypewriterScroll always fires on
+            // pair insertion even when the line number hasn't changed.
+            // Without this the early-exit guard short-circuits and the view
+            // is left un-centred after the pair is inserted.
+            if (typewriterModeRef.current) {
+              lastLineIndexRef.current = -1;
+            }
             correctNative(updated, diffPos + 1);
             runTypewriterScroll(updated, diffPos + 1);
             snapScrollToCursor(updated, diffPos + 1);
+            scheduleSave();
             return;
           }
         }
+
         // Skip-over: typing a close char when one already follows the cursor.
-        // Same snap-scroll treatment as smart-enter.
         if (CLOSE_CHARS.has(insertedChar) && charAfterCursor === insertedChar) {
-          setContent(oldText);
+          if (typewriterModeRef.current) {
+            lastLineIndexRef.current = -1;
+          }
           correctNative(oldText, diffPos + 1);
           runTypewriterScroll(oldText, diffPos + 1);
           snapScrollToCursor(oldText, diffPos + 1);
           return;
         }
+      } else {
+        pendingEnterSkipRef.current = false;
       }
 
-      // Paired backspace: if the user deletes an opening bracket/quote that
-      // is immediately followed by its matching close (i.e. an empty auto-pair
-      // like "(|)"), delete both so the close bracket isn't stranded.
+      // ── Paired backspace: delete both halves of an empty auto-pair ────────
       if (lenDiff === -1) {
         const bpDiffPos = commonPrefixLen(
           oldText,
@@ -672,33 +700,26 @@ export function Editor({
           const paired =
             oldText.slice(0, bpDiffPos) + oldText.slice(bpDiffPos + 2);
           pushHistory(oldText);
-          setContent(paired);
+          contentRef.current = paired;
           correctNative(paired, bpDiffPos);
           snapScrollToCursor(paired, bpDiffPos);
+          scheduleSave();
           return;
         }
       }
 
       pushHistory(oldText);
-      // Fix 1 — paste lag: large insertions (pastes) are marked as
-      // non-urgent via startTransition so React can yield to the UI
-      // thread during the re-render, keeping the app responsive.
-      // The threshold (200 chars) is high enough to avoid affecting
-      // normal typing and auto-correct but catches any real paste.
-      const lenDiffAbs = Math.abs(lenDiff);
-      if (lenDiffAbs > 200) {
-        startTransition(() => setContent(newText));
-      } else {
-        setContent(newText);
-      }
-      // Estimate the post-edit cursor position from the common prefix/suffix
-      // between old and new text — the same authoritative newText the input
-      // just reported, not a stale `content` closure — so typewriter scroll
-      // tracks the real edit instead of chasing a value that's about to
-      // change again on the next keystroke. Both scans are anchored near
-      // the caret's last known position instead of always starting at index
-      // 0 / the very end — see commonPrefixLen/commonSuffixLen for why that
-      // matters on long documents.
+
+      // Update the content ref synchronously. This is now the source of truth
+      // for all subsequent operations (save, undo history, typewriter scroll).
+      // We do NOT call setContent here because the TextInput is uncontrolled:
+      // there is no `value` prop, so React never re-pushes the full document
+      // string across the JS-native bridge on every keystroke. This is the
+      // primary fix for typing lag on long documents.
+      contentRef.current = newText;
+      scheduleSave();
+
+      // Estimate the post-edit cursor position for typewriter scroll.
       const minLen = Math.min(oldText.length, newText.length);
       const prefix = commonPrefixLen(
         oldText,
@@ -715,21 +736,19 @@ export function Editor({
       const estimatedCursor = newText.length - suffix;
       runTypewriterScroll(newText, estimatedCursor);
     },
-    [correctNative, pushHistory, runTypewriterScroll, snapScrollToCursor],
+    [
+      correctNative,
+      pushHistory,
+      runTypewriterScroll,
+      snapScrollToCursor,
+      scheduleSave,
+    ],
   );
 
   const focus = useCallback(() => {
     inputRef.current?.focus();
   }, []);
 
-  // Shared guard for shortcut-bar-triggered edits (applyShortcut, insertText):
-  // if the editor never had focus this session, `cursorRef` is still sitting
-  // at whatever it was initialized to rather than a position the user chose,
-  // so force focus first. On Android, focusing a multiline TextInput without
-  // an explicit selection places the caret at the end of the text, which
-  // matches cursorRef's own initial default -- so this makes the "insert
-  // lands at the end when nothing was focused yet" behavior consistent and
-  // visible (a blinking caret at the end) rather than a silent surprise.
   const ensureFocused = useCallback(() => {
     if (!isFocusedRef.current) {
       inputRef.current?.focus();
@@ -749,8 +768,11 @@ export function Editor({
 
       if (s.kind === "insert") {
         const updated = before + s.payload + after;
-        setContent(updated);
-        setCursor(start + s.payload.length);
+        contentRef.current = updated;
+        // With an uncontrolled TextInput we must push text via setNativeProps;
+        // setContent alone would not update the native view.
+        correctNative(updated, start + s.payload.length);
+        scheduleSave();
         return;
       }
       if (s.kind === "wrap" || s.kind === "pair") {
@@ -758,16 +780,18 @@ export function Editor({
         const close = s.closing ?? s.payload;
         if (middle.length > 0) {
           const updated = before + open + middle + close + after;
-          setContent(updated);
-          setCursor(end + open.length + close.length);
+          contentRef.current = updated;
+          correctNative(updated, end + open.length + close.length);
+          scheduleSave();
         } else {
           const updated = before + open + close + after;
-          setContent(updated);
-          setCursor(start + open.length);
+          contentRef.current = updated;
+          correctNative(updated, start + open.length);
+          scheduleSave();
         }
       }
     },
-    [setCursor, pushHistory, ensureFocused],
+    [correctNative, pushHistory, ensureFocused, scheduleSave],
   );
 
   const insertText = useCallback(
@@ -776,23 +800,33 @@ export function Editor({
       const start = cursorRef.current.start;
       const end = cursorRef.current.end;
       pushHistory(contentRef.current);
-      const updated = contentRef.current.slice(0, start) + text + contentRef.current.slice(end);
-      setContent(updated);
-      setCursor(start + text.length);
+      const updated =
+        contentRef.current.slice(0, start) +
+        text +
+        contentRef.current.slice(end);
+      contentRef.current = updated;
+      correctNative(updated, start + text.length);
+      scheduleSave();
     },
-    [setCursor, pushHistory, ensureFocused],
+    [correctNative, pushHistory, ensureFocused, scheduleSave],
   );
 
   const undo = useCallback(() => {
     const h = historyRef.current;
     if (h.past.length === 0) return;
     const { text: prev, cursor } = h.past.pop()!;
-    h.future.push({ text: contentRef.current, cursor: cursorRef.current.start });
+    h.future.push({
+      text: contentRef.current,
+      cursor: cursorRef.current.start,
+    });
     if (h.future.length > HISTORY_LIMIT) h.future.shift();
-    setContent(prev);
-    setCursor(cursor);
+    contentRef.current = prev;
+    // Push the reverted text to the native layer. With an uncontrolled
+    // TextInput, setContent alone would not update the view.
+    correctNative(prev, cursor);
+    scheduleSave();
     notifyUndoRedo();
-  }, [setCursor, notifyUndoRedo]);
+  }, [correctNative, scheduleSave, notifyUndoRedo]);
 
   const redo = useCallback(() => {
     const h = historyRef.current;
@@ -800,27 +834,31 @@ export function Editor({
     const { text: next, cursor } = h.future.pop()!;
     h.past.push({ text: contentRef.current, cursor: cursorRef.current.start });
     if (h.past.length > HISTORY_LIMIT) h.past.shift();
-    setContent(next);
-    setCursor(cursor);
+    contentRef.current = next;
+    correctNative(next, cursor);
+    scheduleSave();
     notifyUndoRedo();
-  }, [content, setCursor, notifyUndoRedo]);
+  }, [correctNative, scheduleSave, notifyUndoRedo]);
 
   const toggleFindReplace = useCallback(() => {
-    setFindReplaceOpen((v) => !v);
+    setFindReplaceOpen((v) => {
+      if (!v) {
+        // Sync contentRef into React state so FindReplaceBar searches the
+        // latest text — content state may be behind contentRef since normal
+        // typing no longer calls setContent on every keystroke.
+        setContent(contentRef.current);
+      }
+      return !v;
+    });
   }, []);
 
-  // Jump the cursor + scroll to a given line — used by the Outline tab in the
-  // right panel. Unlike runTypewriterScroll (gated on typewriterMode so it
-  // doesn't fight manual scrolling while typing), this always scrolls once,
-  // since it's an explicit user navigation action.
   const jumpToLine = useCallback(
     (lineIndex: number) => {
       const lines = contentRef.current.split("\n");
       const clamped = Math.max(0, Math.min(lineIndex, lines.length - 1));
-      const pos = lines.slice(0, clamped).reduce((n, l) => n + l.length + 1, 0);
-      // Set isAutoScrollingRef BEFORE setCursor so the onSelectionChange event
-      // that fires from setNativeProps inside setCursor doesn't trigger a
-      // competing runTypewriterScroll animation on the same line.
+      const pos = lines
+        .slice(0, clamped)
+        .reduce((n, l) => n + l.length + 1, 0);
       isAutoScrollingRef.current = true;
       setCursor(pos);
       focus();
@@ -836,19 +874,19 @@ export function Editor({
       const targetY = Math.max(0, lineY - 40);
       lastLineIndexRef.current = clamped;
       cancelAnimation(scrollTargetY);
-      scrollTargetY.value = withSpring(targetY, {
-        mass: 0.4,
-        damping: 22,
-        stiffness: 200,
-      }, () => {
-        "worklet";
-        runOnJS(setNotAutoScrolling)();
-      });
+      scrollTargetY.value = withSpring(
+        targetY,
+        { mass: 0.4, damping: 22, stiffness: 200 },
+        () => {
+          "worklet";
+          runOnJS(setNotAutoScrolling)();
+        },
+      );
     },
     [setCursor, focus, setNotAutoScrolling],
   );
 
-  // Expose handle to parent
+  // Expose handle to parent.
   useEffect(() => {
     registerHandle?.({
       applyShortcut,
@@ -882,41 +920,57 @@ export function Editor({
 
   const handleReplaceOne = useCallback(
     (match: FindMatch, replacement: string) => {
-      pushHistory(content);
+      // Use contentRef (not content state) so we always operate on the latest
+      // text even if content state hasn't caught up with recent typing.
+      const current = contentRef.current;
+      pushHistory(current);
       const updated =
-        content.slice(0, match.start) + replacement + content.slice(match.end);
-      setContent(updated);
+        current.slice(0, match.start) +
+        replacement +
+        current.slice(match.end);
       const pos = match.start + replacement.length;
-      setCursor(pos);
+      contentRef.current = updated;
+      correctNative(updated, pos);
+      setContent(updated); // keep state in sync for FindReplaceBar re-search
+      scheduleSave();
     },
-    [content, pushHistory, setCursor],
+    [pushHistory, correctNative, scheduleSave],
   );
 
   const handleReplaceAll = useCallback(
     (query: string, replacement: string, caseSensitive: boolean): number => {
       if (!query) return 0;
-      const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const re = new RegExp(escapeRe(query), "g" + (caseSensitive ? "" : "i"));
-      const matches = contentRef.current.match(re);
+      const escapeRe = (s: string) =>
+        s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp(
+        escapeRe(query),
+        "g" + (caseSensitive ? "" : "i"),
+      );
+      const current = contentRef.current;
+      const matches = current.match(re);
       if (!matches || matches.length === 0) return 0;
-      pushHistory(contentRef.current);
-      // Escape $ so JS doesn't treat $1,       const updated = content.replace(re, replacement); etc. as regex back-references.
+      pushHistory(current);
       const escapedReplacement = replacement.replace(/\$/g, "$$");
-      const updated = contentRef.current.replace(re, escapedReplacement);
-      setContent(updated);
+      const updated = current.replace(re, escapedReplacement);
+      contentRef.current = updated;
+      correctNative(updated, updated.length);
+      setContent(updated); // keep state in sync for FindReplaceBar re-search
+      scheduleSave();
       return matches.length;
     },
-    [pushHistory],
+    [pushHistory, correctNative, scheduleSave],
   );
 
   const acceptRecovery = useCallback(() => {
     if (recoveryOffer === null) return;
     pushHistory(contentRef.current);
+    contentRef.current = recoveryOffer;
+    correctNative(recoveryOffer, recoveryOffer.length);
     setContent(recoveryOffer);
-    setCursor(recoveryOffer.length);
     setRecoveryOffer(null);
     clearRecoveryBuffer(noteId).catch(() => {});
-  }, [recoveryOffer, pushHistory, setCursor, noteId]);
+    scheduleSave();
+  }, [recoveryOffer, pushHistory, correctNative, scheduleSave, noteId]);
 
   const dismissRecovery = useCallback(() => {
     setRecoveryOffer(null);
@@ -996,7 +1050,10 @@ export function Editor({
           ]}
         >
           <Feather name="alert-triangle" size={14} color={c.accent} />
-          <Text style={[styles.recoveryText, { color: c.text }]} numberOfLines={2}>
+          <Text
+            style={[styles.recoveryText, { color: c.text }]}
+            numberOfLines={2}
+          >
             We found unsaved changes from before. Restore them?
           </Text>
           <Pressable onPress={acceptRecovery} hitSlop={6}>
@@ -1024,30 +1081,25 @@ export function Editor({
         onLayout={(e) => {
           scrollViewHeightRef.current = e.nativeEvent.layout.height;
         }}
+        onScrollBeginDrag={() => {
+          if (typewriterModeRef.current) {
+            // User dragged manually — invalidate the cached line index so the
+            // next keystroke triggers a fresh re-center rather than skipping
+            // because the line number hasn't changed.
+            lastLineIndexRef.current = -1;
+          }
+        }}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="interactive"
         showsVerticalScrollIndicator={false}
         bottomOffset={bottomOffset}
-        // While typewriter mode is active, our own runTypewriterScroll
-        // above already drives an authoritative centered-scroll on every
-        // line change. Leaving this library's own selection-driven
-        // auto-scroll enabled at the same time meant two independent
-        // systems raced to scroll to two different target offsets on every
-        // keystroke that advanced a line (Enter, and auto-paired
-        // quotes/brackets both count) -- that fight was the jitter/jump
-        // reported when typing quotes or pressing Enter. Disabling this
-        // one while typewriter mode owns the scroll leaves a single
-        // authority in charge; the static `paddingBottom: 300` above
-        // already reserves enough room for the keyboard in that mode.
+        // Disable the library's own keyboard-avoidance scroll in typewriter
+        // mode — runTypewriterScroll owns that entirely.
         enabled={!typewriterMode}
-        // Also lock out manual touch-scrolling in typewriter mode. A user
-        // drag that nudges the scroll offset used to fight the very next
-        // programmatic re-center on the next line change -- two authorities
-        // disagreeing about the scroll position one frame apart is exactly
-        // what reads as "bounce"/oscillation. Typewriter mode's whole
-        // premise is that scroll position is not manual, so give
-        // runTypewriterScroll sole ownership while it's on.
-        scrollEnabled={!typewriterMode}
+        // Always allow manual touch-scrolling. In typewriter mode, dragging
+        // overrides the auto-center; the next keystroke re-centers via the
+        // lastLineIndexRef reset in onScrollBeginDrag above.
+        scrollEnabled={true}
       >
         <View
           style={{
@@ -1072,8 +1124,15 @@ export function Editor({
           ) : (
             <TextInput
               ref={inputRef}
-              value={content}
+              // No `value` prop — this TextInput is uncontrolled. The native
+              // layer manages its own content during typing; corrections
+              // (auto-pair, smart-enter, undo/redo, etc.) are pushed via
+              // correctNative / setNativeProps. This eliminates the
+              // per-keystroke JS→native bridge round-trip of the full document
+              // string, fixing lag on documents longer than ~3 k words.
+              defaultValue={initialContent}
               onChangeText={handleChangeText}
+              onKeyPress={handleKeyPress}
               onSelectionChange={handleSelectionChange}
               onFocus={() => {
                 isFocusedRef.current = true;
@@ -1093,10 +1152,6 @@ export function Editor({
               selectionColor={c.selection}
               underlineColorAndroid="transparent"
               scrollEnabled={false}
-              // Stops Android from forcing the input into a full-screen edit
-              // overlay on some devices/keyboard combos (notably landscape
-              // or small screens), which otherwise briefly tears the editor
-              // away from this layout entirely on focus -- read as a jump.
               disableFullscreenUI
               style={[
                 styles.input,
@@ -1122,12 +1177,24 @@ export function Editor({
 
       {/* Write / Read mode toggle */}
       <Pressable
-        onPress={() => setPreviewMode((p) => !p)}
+        onPress={() => {
+          setPreviewMode((p) => {
+            if (!p) {
+              // Sync contentRef into React state before entering preview so
+              // MarkdownPreview gets the latest text. content state may be
+              // behind contentRef since normal typing no longer calls setContent.
+              setContent(contentRef.current);
+            }
+            return !p;
+          });
+        }}
         style={[
           styles.previewToggle,
           { backgroundColor: c.surface, borderColor: c.border },
         ]}
-        accessibilityLabel={previewMode ? "Switch to write mode" : "Switch to preview mode"}
+        accessibilityLabel={
+          previewMode ? "Switch to write mode" : "Switch to preview mode"
+        }
       >
         <Feather
           name={previewMode ? "edit-3" : "eye"}
@@ -1156,9 +1223,7 @@ export function Editor({
             · {stats.chars.toLocaleString()} ch · {stats.mins} min
           </Text>
           {savedTick > 0 ? (
-            <View
-              style={[styles.savedDot, { backgroundColor: c.accent }]}
-            />
+            <View style={[styles.savedDot, { backgroundColor: c.accent }]} />
           ) : null}
         </Pressable>
       ) : showWordCount && collapsedCount ? (
@@ -1192,8 +1257,6 @@ const styles = StyleSheet.create({
   },
   scrollContent: {
     flexGrow: 1,
-    // paddingBottom is applied inline (typewriter: 300, normal: 80) — the
-    // static value here was dead code shadowed by the JSX inline style array.
   },
   input: {
     width: "100%",

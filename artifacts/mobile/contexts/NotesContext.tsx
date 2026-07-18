@@ -605,21 +605,26 @@ export function NotesProvider({ children }: { children: React.ReactNode }) {
   const updateNoteContent = useCallback(
     (id: string, content: string) => {
       if (isExternal) {
-        setExternalNotes((prev) =>
-          prev.map((n) =>
-            n.id === id
-              ? { ...n, content, updatedAt: Date.now(), loaded: true }
-              : n,
-          ),
-        );
-        // Debounced write to disk
+        // Cache content in memory without calling setExternalNotes, so the
+        // sidebar and file tree don't re-render on every autosave tick while
+        // the user is typing. State is updated once after the debounced disk
+        // write completes, which is the right time for the UI to refresh.
+        contentCacheRef.current[id] = content;
         const note = externalNotes.find((n) => n.id === id);
         if (note?.externalUri) {
           if (writeTimers.current[id]) clearTimeout(writeTimers.current[id]);
           writeTimers.current[id] = setTimeout(() => {
-            safWriteFile(note.externalUri!, content).catch((err) => {
+            const latest = contentCacheRef.current[id] ?? content;
+            safWriteFile(note.externalUri!, latest).catch((err) => {
               console.warn("Failed to write file", err);
             });
+            setExternalNotes((prev) =>
+              prev.map((n) =>
+                n.id === id
+                  ? { ...n, content: latest, updatedAt: Date.now(), loaded: true }
+                  : n,
+              ),
+            );
           }, 600);
         }
       } else {
