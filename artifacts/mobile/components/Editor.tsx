@@ -250,6 +250,22 @@ export function Editor({
   useEffect(() => {
     activeThemeRef.current = activeTheme;
   }, [activeTheme]);
+  // Effective font-size and line-height ratio: mirror the panel overrides so
+  // all scroll calculations (typewriter centering, snapScrollToCursor,
+  // jumpToLine) use the values the TextInput actually renders at, not the
+  // raw theme defaults. Without these refs the centering drifts whenever the
+  // user picks a custom font size or line spacing.
+  const effectiveFontSizeRef = useRef(
+    editorFontSize > 0 ? editorFontSize : activeTheme.fontSize,
+  );
+  const effectiveLineHeightRatioRef = useRef(LINE_SPACING_MAP[lineSpacing]);
+  useEffect(() => {
+    effectiveFontSizeRef.current =
+      editorFontSize > 0 ? editorFontSize : activeTheme.fontSize;
+  }, [editorFontSize, activeTheme.fontSize]);
+  useEffect(() => {
+    effectiveLineHeightRatioRef.current = LINE_SPACING_MAP[lineSpacing];
+  }, [lineSpacing]);
   // Tracks the live soft-keyboard height via real OS show/hide events rather
   // than relying on the container's onLayout height changing. Android is
   // configured with softwareKeyboardLayoutMode="pan" (required for
@@ -263,10 +279,12 @@ export function Editor({
   const keyboardHeightRef = useRef(0);
   const [debouncedStatsContent, setDebouncedStatsContent] = useState(content);
 
-  // Undo / redo history
+  // Undo / redo history — each entry stores text AND the cursor position
+  // at the time of the change so that undo/redo restores the cursor to
+  // where the edit was made, not always the end of the document.
   const historyRef = useRef<{
-    past: string[];
-    future: string[];
+    past: { text: string; cursor: number }[];
+    future: { text: string; cursor: number }[];
     lastChangeAt: number;
   }>({
     past: [],
@@ -304,21 +322,18 @@ export function Editor({
       if (
         buf &&
         buf.content !== initialContent &&
-        buf.content.trim().length > 0
+        buf.content.trim().length > 0 &&
+        // Only offer recovery if it has at least as many characters as the
+        // currently loaded content. Because the recovery buffer is now written
+        // inside the same 120ms autosave debounce, a shorter buffer means the
+        // user genuinely deleted content — not a scenario worth prompting for.
+        buf.content.length >= initialContent.length
       ) {
         setRecoveryOffer(buf.content);
       }
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [noteId]);
-
-  // Continuously persist a crash-recovery buffer as the user types
-  useEffect(() => {
-    const t = setTimeout(() => {
-      saveRecoveryBuffer(noteId, content).catch(() => {});
-    }, 800);
-    return () => clearTimeout(t);
-  }, [noteId, content]);
 
   // Track net word-count delta against the writing-stats tracker (goal + streak)
   const applyWordDelta = useCallback(
@@ -347,7 +362,11 @@ export function Editor({
     }
   }, [content, noteId, updateNoteContent, onChangeContent, applyWordDelta]);
 
-  // Schedule debounced save on every content change (100ms)
+  // Schedule debounced save on every content change (120ms).
+  // The recovery buffer is written in the same timer as the note content so
+  // they're always at the same version — a separate 800ms recovery timer
+  // could be older than the autosave on crash, causing the banner to offer
+  // to "restore" to earlier content.
   useEffect(() => {
     if (lastSavedRef.current === content) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
@@ -358,6 +377,7 @@ export function Editor({
       setSavedTick((t) => t + 1);
       applyWordDelta(content);
       maybeSnapshot(noteId, content).catch(() => {});
+      saveRecoveryBuffer(noteId, content).catch(() => {});
     }, 120);
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
@@ -424,8 +444,10 @@ export function Editor({
       if (lineIndex === lastLineIndexRef.current) return;
       lastLineIndexRef.current = lineIndex;
 
-      const lineHeightPx = activeTheme.fontSize * activeTheme.lineHeight;
-      const lineY = lineIndex * lineHeightPx + activeTheme.paddingVertical;
+      const lineHeightPx =
+        effectiveFontSizeRef.current * effectiveLineHeightRatioRef.current;
+      const lineY =
+        lineIndex * lineHeightPx + activeThemeRef.current.paddingVertical;
       const visibleHeight = Math.max(
         120,
         scrollViewHeightRef.current - keyboardHeightRef.current,
@@ -447,7 +469,7 @@ export function Editor({
         isAutoScrollingRef.current = false;
       });
     },
-    [typewriterMode, activeTheme, scrollYAnim],
+    [typewriterMode, scrollYAnim],
   );
 
   const handleSelectionChange = useCallback(
@@ -465,9 +487,12 @@ export function Editor({
       onSelectionChange?.(e.nativeEvent.selection);
       // Covers cursor moves that aren't text edits (taps, arrow keys) — edits
       // are handled synchronously inside handleChangeText instead.
-      if (!isAutoScrollingRef.current) {
-        runTypewriterScroll(content, e.nativeEvent.selection.start);
-      }
+      // Note: we don't guard on isAutoScrollingRef here. runTypewriterScroll
+      // already short-circuits via lastLineIndexRef when the line hasn't
+      // changed, which handles the common case. The old isAutoScrollingRef
+      // guard was preventing tap-to-new-line from re-centering during an
+      // in-flight animation, leaving the view centered on the wrong line.
+      runTypewriterScroll(content, e.nativeEvent.selection.start);
     },
     [onSelectionChange, content, runTypewriterScroll],
   );
@@ -514,10 +539,10 @@ export function Editor({
   // Skipped in typewriter mode where runTypewriterScroll owns scrolling.
   const snapScrollToCursor = useCallback((text: string, position: number) => {
     if (typewriterModeRef.current || !scrollRef.current) return;
-    const theme = activeThemeRef.current;
     const lineIndex = text.slice(0, position).split("\n").length - 1;
-    const lineHeightPx = theme.fontSize * theme.lineHeight;
-    const lineY = lineIndex * lineHeightPx + theme.paddingVertical;
+    const lineHeightPx =
+      effectiveFontSizeRef.current * effectiveLineHeightRatioRef.current;
+    const lineY = lineIndex * lineHeightPx + activeThemeRef.current.paddingVertical;
     const visibleH = Math.max(
       120,
       scrollViewHeightRef.current - keyboardHeightRef.current,
@@ -533,7 +558,7 @@ export function Editor({
       const grouped =
         h.past.length > 0 && now - h.lastChangeAt < HISTORY_GROUP_MS;
       if (!grouped) {
-        h.past.push(prev);
+        h.past.push({ text: prev, cursor: cursorRef.current.start });
         if (h.past.length > HISTORY_LIMIT) h.past.shift();
       }
       h.future = [];
@@ -592,6 +617,30 @@ export function Editor({
           correctNative(oldText, diffPos + 1);
           runTypewriterScroll(oldText, diffPos + 1);
           snapScrollToCursor(oldText, diffPos + 1);
+          return;
+        }
+      }
+
+      // Paired backspace: if the user deletes an opening bracket/quote that
+      // is immediately followed by its matching close (i.e. an empty auto-pair
+      // like "(|)"), delete both so the close bracket isn't stranded.
+      if (lenDiff === -1) {
+        const bpDiffPos = commonPrefixLen(
+          oldText,
+          newText,
+          cursorRef.current.start,
+        );
+        const deletedChar = oldText[bpDiffPos] ?? "";
+        const charAfterDeletion = oldText[bpDiffPos + 1] ?? "";
+        if (
+          PAIR_OPEN_TO_CLOSE[deletedChar] !== undefined &&
+          PAIR_OPEN_TO_CLOSE[deletedChar] === charAfterDeletion
+        ) {
+          const paired =
+            oldText.slice(0, bpDiffPos) + oldText.slice(bpDiffPos + 2);
+          pushHistory(oldText);
+          setContent(paired);
+          correctNative(paired, bpDiffPos);
           return;
         }
       }
@@ -703,22 +752,22 @@ export function Editor({
   const undo = useCallback(() => {
     const h = historyRef.current;
     if (h.past.length === 0) return;
-    const prev = h.past.pop()!;
-    h.future.push(content);
+    const { text: prev, cursor } = h.past.pop()!;
+    h.future.push({ text: content, cursor: cursorRef.current.start });
     if (h.future.length > HISTORY_LIMIT) h.future.shift();
     setContent(prev);
-    setCursor(prev.length);
+    setCursor(cursor);
     notifyUndoRedo();
   }, [content, setCursor, notifyUndoRedo]);
 
   const redo = useCallback(() => {
     const h = historyRef.current;
     if (h.future.length === 0) return;
-    const next = h.future.pop()!;
-    h.past.push(content);
+    const { text: next, cursor } = h.future.pop()!;
+    h.past.push({ text: content, cursor: cursorRef.current.start });
     if (h.past.length > HISTORY_LIMIT) h.past.shift();
     setContent(next);
-    setCursor(next.length);
+    setCursor(cursor);
     notifyUndoRedo();
   }, [content, setCursor, notifyUndoRedo]);
 
@@ -735,12 +784,21 @@ export function Editor({
       const lines = content.split("\n");
       const clamped = Math.max(0, Math.min(lineIndex, lines.length - 1));
       const pos = lines.slice(0, clamped).reduce((n, l) => n + l.length + 1, 0);
+      // Set isAutoScrollingRef BEFORE setCursor so the onSelectionChange event
+      // that fires from setNativeProps inside setCursor doesn't trigger a
+      // competing runTypewriterScroll animation on the same line.
+      isAutoScrollingRef.current = true;
       setCursor(pos);
       focus();
 
-      if (!scrollRef.current) return;
-      const lineHeightPx = activeTheme.fontSize * activeTheme.lineHeight;
-      const lineY = clamped * lineHeightPx + activeTheme.paddingVertical;
+      if (!scrollRef.current) {
+        isAutoScrollingRef.current = false;
+        return;
+      }
+      const lineHeightPx =
+        effectiveFontSizeRef.current * effectiveLineHeightRatioRef.current;
+      const lineY =
+        clamped * lineHeightPx + activeThemeRef.current.paddingVertical;
       const targetY = Math.max(0, lineY - 40);
       lastLineIndexRef.current = clamped;
       isAutoScrollingRef.current = true;
@@ -758,7 +816,7 @@ export function Editor({
         isAutoScrollingRef.current = false;
       });
     },
-    [content, setCursor, focus, activeTheme, scrollYAnim],
+    [content, setCursor, focus, scrollYAnim],
   );
 
   // Expose handle to parent
@@ -813,7 +871,9 @@ export function Editor({
       const matches = content.match(re);
       if (!matches || matches.length === 0) return 0;
       pushHistory(content);
-      const updated = content.replace(re, replacement);
+      // Escape $ so JS doesn't treat $1,       const updated = content.replace(re, replacement); etc. as regex back-references.
+      const escapedReplacement = replacement.replace(/\$/g, "$$");
+      const updated = content.replace(re, escapedReplacement);
       setContent(updated);
       return matches.length;
     },
@@ -1103,7 +1163,8 @@ const styles = StyleSheet.create({
   },
   scrollContent: {
     flexGrow: 1,
-    paddingBottom: 80,
+    // paddingBottom is applied inline (typewriter: 300, normal: 80) — the
+    // static value here was dead code shadowed by the JSX inline style array.
   },
   input: {
     width: "100%",
